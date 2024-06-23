@@ -1,0 +1,178 @@
+# Copyright 2022 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+---
+
+blueprint_name: hpc-slurm
+
+vars:
+  project_id:  ## Set GCP Project ID Here ##
+  deployment_name: hpc-slurm-test
+  region: us-central1
+  zone: us-central1-a
+  new_image:
+    family: ml-slurm-test
+    project: $(vars.project_id)
+  disk_size_gb: 200
+# Documentation for each of the modules used below can be found at
+# https://github.com/GoogleCloudPlatform/hpc-toolkit/blob/main/modules/README.md
+
+deployment_groups:
+#######
+
+
+- group: primary
+  modules:
+  # Source is an embedded module, denoted by "modules/*" without ./, ../, /
+  # as a prefix. To refer to a local module, prefix with ./, ../ or /
+  # Example - ./modules/network/vpc
+  - id: hpc_dashboard
+    source: modules/monitoring/dashboard
+    outputs: [instructions]
+
+  - id: network
+    source: modules/network/vpc
+
+
+  - id: singularity-install-script
+    source: modules/scripts/startup-script
+    settings:
+      runners:
+      - type: shell
+        destination: singularity-install.sh
+        content: |
+          #!/bin/bash
+          set -e -o pipefail
+          wget -O- http://neuro.debian.net/lists/bullseye.us-tn.full | sudo tee /etc/apt/sources.list.d/neurodebian.sources.list
+          sudo apt-key adv --recv-keys --keyserver hkps://keyserver.ubuntu.com 0xA5D32F012649A5A9
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get --assume-yes  install  singularity-container
+  - id: homefs
+    source: modules/file-system/filestore
+    use: [network]
+    settings:
+      local_mount: /home
+      size_gb: 10240
+
+  - id: scratchfs
+    source: modules/file-system/filestore
+    use: [network]
+    settings:
+      local_mount: /scratch
+      filestore_tier: BASIC_SSD #HIGH_SCALE_SSD
+      size_gb: 10240
+  
+  - id: data-bucket-TCGA
+    source: modules/file-system/pre-existing-network-storage
+    settings:
+      remote_mount: gdc-tcga-phs000178-open
+      local_mount: /TCGA
+      fs_type: gcsfuse
+      mount_options: defaults,_netdev,implicit_dirs,allow_other
+
+  - id: data-bucket-artifacts
+    source: modules/file-system/pre-existing-network-storage
+    settings:
+      remote_mount: #insert name of output bucket here
+      local_mount: /artifacts
+      fs_type: gcsfuse
+      mount_options: defaults,_netdev,implicit_dirs,allow_other
+
+- group: image-builder
+  modules:
+  - id: custom-image
+    source: modules/packer/custom-image
+    kind: packer
+    use:
+    - singularity-install-script
+    - network
+
+    settings:
+      # give VM a public IP to ensure startup script can reach public internet
+      # w/o new VPC
+      omit_external_ip: false
+      source_image_project_id: [schedmd-slurm-public]
+      # see latest in https://github.com/GoogleCloudPlatform/slurm-gcp/blob/master/docs/images.md#published-image-family
+      source_image_family: slurm-gcp-6-4-debian-11
+      # You can find size of source image by using following command
+      # gcloud compute images describe-from-family <source_image_family> --project schedmd-slurm-public
+      disk_size: $(vars.disk_size_gb)
+      image_family: $(vars.new_image.family)
+      # building this image does not require a GPU-enabled VM
+      machine_type: c2-standard-4
+      state_timeout: 15m
+- group: cluster
+  modules:
+  - id: debug_nodeset
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [network]
+    settings:
+      machine_type: n2-standard-2
+      node_count_dynamic_max: 4
+      enable_placement: false # the default is: true
+
+  - id: debug_partition
+    source: community/modules/compute/schedmd-slurm-gcp-v6-partition
+    use: 
+    - debug_nodeset 
+    settings:
+      partition_name: debug
+      exclusive: false # allows nodes to stay up after jobs are done
+      is_default: true
+
+  - id: compute_nodeset
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: 
+    - network
+    settings:
+      node_count_dynamic_max: 32
+      machine_type: n1-standard-16
+      instance_image: $(vars.new_image)
+      instance_image_custom: true
+      guest_accelerator: 
+        - type: nvidia-tesla-t4
+          count: 2      
+      bandwidth_tier: gvnic_enabled
+
+  - id: compute_partition
+    source: community/modules/compute/schedmd-slurm-gcp-v6-partition
+    use:
+    - compute_nodeset
+    settings:
+      partition_name: compute
+
+
+
+  - id: slurm_login
+    source: community/modules/scheduler/schedmd-slurm-gcp-v6-login
+    use: 
+    - network
+    settings:
+      name_prefix: login
+      machine_type: n2-standard-4
+      disable_login_public_ips: false
+
+  - id: slurm_controller
+    source: community/modules/scheduler/schedmd-slurm-gcp-v6-controller
+    use:
+    - network
+    - debug_partition
+    - compute_partition  
+    - data-bucket-artifacts
+    - data-bucket-TCGA
+    - homefs
+    - scratchfs
+    - slurm_login
+    settings:
+      disable_controller_public_ips: false
